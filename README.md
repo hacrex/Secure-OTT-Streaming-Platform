@@ -130,3 +130,8 @@ We welcome contributions! If you have ideas for enhancements or find any issues,
 This project is licensed under the [MIT License](LICENSE).
 
 Happy Coding! 🚀
+
+## 🛠️ Functional Templates
+This repository includes production-ready templates to get started quickly:
+- **Terraform**: Located in `terraform/templates/` for cluster and provider setup.
+- **Kubernetes**: Located in `kubernetes/manifests/` for application deployment and security policies.
