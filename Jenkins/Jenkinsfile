@@ -1,145 +1,105 @@
-pipeline{
-    agent any
-    tools{
-        nodejs 'nodejs'
+pipeline {
+  agent any
+
+  tools {
+    nodejs 'nodejs'
+  }
+
+  parameters {
+    string(name: 'IMAGE_REPOSITORY', defaultValue: 'ghcr.io/hacrex/secure-ott-streaming-platform', description: 'Container repository to publish when PUBLISH_IMAGE is enabled')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional immutable image tag; defaults to the Jenkins build number')
+    booleanParam(name: 'PUBLISH_IMAGE', defaultValue: false, description: 'Push the image only after validation succeeds')
+    booleanParam(name: 'DEPLOY', defaultValue: false, description: 'Deploy only after an approved change window')
+  }
+
+  environment {
+    IMAGE_TAG = "${params.IMAGE_TAG ?: env.BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
     }
-    environment {
-        SCANNER_HOME=tool 'sonar-server'
+
+    stage('Application build') {
+      steps {
+        dir('Application-Code') {
+          sh 'corepack enable'
+          sh 'yarn install --frozen-lockfile'
+          sh 'yarn build'
+        }
+      }
     }
-    stages {
-        stage('Workspace Cleaning'){
-            steps{
-                cleanWs()
-            }
+
+    stage('Terraform validation') {
+      steps {
+        dir('Terraform') {
+          sh 'terraform fmt -check -recursive'
+          sh 'terraform init -backend=false'
+          sh 'terraform validate'
         }
-        stage('Checkout from Git'){
-            steps{
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/Netflix-Clone-K8S-End-to-End-Project.git'
-            }
-        }
-        stage('Install Dependencies') {
-            steps {
-                dir('Application-Code') {
-                    // Install project dependencies (needed for OWASP + build)
-                    sh 'npm install'
-                }
-            }
-        }
-        stage("SonarQube Analysis") {
-            steps {
-                dir('Application-Code') {
-                    withSonarQubeEnv('sonar-server') {
-                        // Run SonarQube scanner using npx (no global install)
-                        sh '''
-                        echo "🔍 Starting SonarQube Analysis..."
-                        npx @sonar/scan \
-                        -Dsonar.projectKey=NetflixClone \
-                        -Dsonar.projectName=NetflixClone \
-                        -Dsonar.sources=src \
-                        -Dsonar.language=ts \
-                        -Dsonar.exclusions=dist/**,node_modules/**,public/** \
-                        -Dsonar.host.url=$SONAR_HOST_URL \
-                        -Dsonar.login=$SONAR_AUTH_TOKEN
-                        '''
-                    }
-                }
-            }
-        }
-        stage("Quality Gate") {
-            steps {
-                    script {
-                        waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
-                    }
-                } 
-            }
-        stage('OWASP Dependency Check') {
-            steps {
-                dir('Application-Code') {
-                    echo "🔒 Running OWASP Dependency Check..."
-                    dependencyCheck additionalArguments: '--scan ./ --format XML --out .', odcInstallation: 'owasp-dp-check'
-                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-                }
-            }
-        }
-        stage('TRIVY FS SCAN') {
-            steps {
-                dir('Application-Code') {
-                    sh "trivy fs . > trivyfs.txt"
-                }
-            }
-        }
-        stage("Docker Image Build"){
-            steps{
-                dir('Application-Code') {
-                    script{
-                       withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){   
-                           
-                           withCredentials([string(credentialsId: 'tmdb-api', variable: 'TMDB_API_KEY')]) {
-                                sh """
-                                    docker build \
-                                    --build-arg TMDB_V3_API_KEY=${TMDB_API_KEY} \
-                                    -t netflix .
-                                """
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        stage("Docker Image Pushing"){
-            steps{
-                dir('Application-Code') {
-                    script{
-                       withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){   
-                           sh "docker tag netflix avian19/netflix:latest "
-                           sh "docker push avian19/netflix:latest "
-                        }
-                    }
-                }
-            }
-        }
-        stage("TRIVY Image Scan"){
-            steps{
-                sh "trivy image avian19/netflix:latest > trivyimage.txt" 
-            }
-        }
-        stage('Deploy to Kubernetes') {
-            steps {
-                script {
-                    dir('Kubernetes') {
-                        withKubeConfig(credentialsId: 'k8s') {
-                            sh 'kubectl apply -f deployment.yml'
-                            sh 'kubectl apply -f service.yml'
-                            sh 'kubectl get svc'
-                            sh 'kubectl get all'
-                        }
-                    }
-                }
-            }
-        }
+      }
     }
-    post {
-        always {
-            script {
-                def colorCode = currentBuild.result == 'SUCCESS' ? '#2eb886' : 
-                                currentBuild.result == 'FAILURE' ? '#ff0000' : '#daa038'
-    
-                slackSend(
-                    channel: '#devops-alerts',
-                    color: colorCode,
-                    message: """
-                    *🚀 Jenkins Build Notification*
-                    *Project:* ${env.JOB_NAME}
-                    *Build Number:* #${env.BUILD_NUMBER}
-                    *Status:* *${currentBuild.result}*
-                    *URL:* <${env.BUILD_URL}|Open Build>
-    
-                    ${currentBuild.result == 'SUCCESS' ? '✅ All steps completed successfully!' : 
-                    currentBuild.result == 'FAILURE' ? '❌ Build failed. Please check logs.' : 
-                    '⚠️ Build is unstable or aborted.'}
-                    """.stripIndent()
-                )
-            }
-        }
+
+    stage('Kubernetes manifest validation') {
+      steps {
+        sh 'kubectl apply --dry-run=client -f Kubernetes/'
+      }
     }
+
+    stage('Filesystem security scan') {
+      steps {
+        sh 'trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 --no-progress Application-Code'
+      }
+    }
+
+    stage('Build container image') {
+      steps {
+        dir('Application-Code') {
+          script {
+            env.IMAGE_REF = "${params.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+          }
+          sh 'docker build -t "$IMAGE_REF" .'
+        }
+      }
+    }
+
+    stage('Image security scan') {
+      steps {
+        sh 'trivy image --severity HIGH,CRITICAL --exit-code 1 --no-progress "$IMAGE_REF"'
+      }
+    }
+
+    stage('Publish image') {
+      when {
+        expression { params.PUBLISH_IMAGE }
+      }
+      steps {
+        withDockerRegistry(credentialsId: 'container-registry', toolName: 'docker') {
+          sh 'docker push "$IMAGE_REF"'
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      when {
+        expression { params.DEPLOY }
+      }
+      steps {
+        script {
+          if (!params.PUBLISH_IMAGE) {
+            error('DEPLOY requires PUBLISH_IMAGE so the deployment references a published immutable image.')
+          }
+        }
+        withKubeConfig(credentialsId: 'k8s') {
+          sh 'kubectl apply -f Kubernetes/'
+          sh 'kubectl set image deployment/netflix-app netflix-app="$IMAGE_REF"'
+          sh 'kubectl annotate deployment/netflix-app hacrex.io/release="$IMAGE_REF" --overwrite'
+          sh './scripts/smoke-test.sh'
+        }
+      }
+    }
+  }
 }
